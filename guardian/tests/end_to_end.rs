@@ -133,6 +133,131 @@ impl Harness {
     }
 }
 
+/// Record a staged scenario, then replay it into a fresh Guardian and assert it
+/// reproduces the same alerts.
+///
+/// This is the workflow the fall heuristic needs: a staged fall (a weighted
+/// cushion, a volunteer onto a mattress) is expensive to reproduce physically,
+/// so it has to be capturable once and replayable against every later change.
+#[test]
+fn a_recorded_scenario_replays_to_the_same_alerts() {
+    let dir = std::env::temp_dir().join(format!("guardian-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let capture = dir.join("fall-then-stillness.jsonl");
+
+    // Stage: normal breathing, one fall, then present-but-not-breathing.
+    {
+        let rec = Harness::start(&[
+            "--record",
+            capture.to_str().unwrap(),
+            "--apnea-timeout-secs",
+            "2",
+            "--node-silent-timeout-secs",
+            "30",
+        ]);
+        rec.stream(
+            &[vitals(1, true, false, 16.0, 72.0)],
+            Duration::from_secs(1),
+        );
+        rec.send(&vitals(1, true, true, 16.0, 72.0));
+        rec.stream(&[vitals(1, true, false, 0.0, 0.0)], Duration::from_secs(4));
+        rec.await_alerts(
+            "fall and apnea while recording",
+            Duration::from_secs(6),
+            |a| a.contains("fall") && a.contains("no_breathing"),
+        );
+    } // recorder dropped and killed; capture flushed per packet
+
+    let packets = std::fs::read_to_string(&capture).expect("capture written");
+    let lines = packets.lines().filter(|l| !l.trim().is_empty()).count();
+    assert!(
+        lines > 50,
+        "expected a substantial capture, got {lines} packets"
+    );
+
+    // Replay into a fresh instance that has never seen a live node.
+    let replayed = Harness::start(&[
+        "--apnea-timeout-secs",
+        "2",
+        "--node-silent-timeout-secs",
+        "30",
+    ]);
+    let status = Command::new(env!("CARGO_BIN_EXE_guardian-replay"))
+        .arg(&capture)
+        .args(["--target", &replayed.udp.to_string()])
+        .args(["--speed", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run guardian-replay");
+    assert!(status.success(), "replay exited with {status}");
+
+    let active = replayed.await_alerts("replayed fall and apnea", Duration::from_secs(8), |a| {
+        a.contains("fall") && a.contains("no_breathing")
+    });
+    assert!(active.contains("fall") && active.contains("no_breathing"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `--inspect` describes a capture without sending anything.
+#[test]
+fn replay_inspect_summarises_without_sending() {
+    let dir = std::env::temp_dir().join(format!("guardian-inspect-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let capture = dir.join("inspect.jsonl");
+
+    {
+        let rec = Harness::start(&[
+            "--record",
+            capture.to_str().unwrap(),
+            "--node-silent-timeout-secs",
+            "30",
+        ]);
+        rec.stream(
+            &[vitals(4, true, false, 14.0, 70.0)],
+            Duration::from_secs(1),
+        );
+    }
+
+    let out = Command::new(env!("CARGO_BIN_EXE_guardian-replay"))
+        .arg(&capture)
+        .arg("--inspect")
+        .output()
+        .expect("run guardian-replay --inspect");
+    assert!(out.status.success());
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("nodes: {4:"), "summary was: {text}");
+    assert!(
+        text.contains("presence in 100% of packets"),
+        "summary was: {text}"
+    );
+    assert!(text.contains("14.0 BPM"), "summary was: {text}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A capture with nothing usable in it must fail loudly rather than sit silent.
+#[test]
+fn replay_rejects_an_empty_capture() {
+    let dir = std::env::temp_dir().join(format!("guardian-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let capture = dir.join("empty.jsonl");
+    std::fs::write(&capture, "").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_guardian-replay"))
+        .arg(&capture)
+        .output()
+        .expect("run guardian-replay");
+    assert!(
+        !out.status.success(),
+        "must not exit 0 on an unusable capture"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Build a 32-byte `edge_vitals_pkt_t` matching `edge_processing.h:140`.
 fn vitals(node_id: u8, presence: bool, fall: bool, breathing_bpm: f64, hr_bpm: f64) -> Vec<u8> {
     let mut b = vec![0u8; 32];
