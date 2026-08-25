@@ -61,6 +61,19 @@ pub struct AlertEvent {
 pub enum Transition {
     Raised,
     Cleared,
+    /// The condition is still active and has not been acknowledged. Emitted on
+    /// a repeating interval so a single missed notification at 03:00 does not
+    /// leave the condition unattended.
+    Reminder,
+}
+
+/// Bookkeeping for one active condition.
+#[derive(Debug, Clone, Copy)]
+struct ActiveAlert {
+    #[allow(dead_code)]
+    raised_at: Instant,
+    /// When this condition last produced an event, so reminders can be paced.
+    last_signalled_at: Instant,
 }
 
 /// Tunable thresholds. Defaults are the ones named in the handoff keep-list.
@@ -72,6 +85,9 @@ pub struct AlertConfig {
     pub absence_timeout: Duration,
     /// How long a node may go quiet before it is considered offline.
     pub node_silent_timeout: Duration,
+    /// How often to re-emit a care alert that is still active. `None` emits
+    /// once per raise.
+    pub repeat_care_alert: Option<Duration>,
 }
 
 impl Default for AlertConfig {
@@ -80,6 +96,7 @@ impl Default for AlertConfig {
             apnea_timeout: Duration::from_secs(60),
             absence_timeout: Duration::from_secs(12 * 60 * 60),
             node_silent_timeout: Duration::from_secs(60),
+            repeat_care_alert: Some(Duration::from_secs(300)),
         }
     }
 }
@@ -114,7 +131,7 @@ pub struct AlertEngine {
     /// actually reliable.
     trusted_nodes: Option<Vec<u8>>,
     nodes: BTreeMap<u8, NodeStatus>,
-    active: BTreeMap<AlertKind, Instant>,
+    active: BTreeMap<AlertKind, ActiveAlert>,
     /// Last moment a trusted node reported presence.
     last_presence_at: Option<Instant>,
     /// Last moment a trusted node reported a plausible breathing rate while
@@ -311,6 +328,10 @@ impl AlertEngine {
             ));
         }
 
+        // Last, so a condition raised or cleared in this same tick is not also
+        // reminded about in it.
+        events.extend(self.reminders(now));
+
         events
     }
 
@@ -343,12 +364,42 @@ impl AlertEngine {
         if self.active.contains_key(&kind) {
             return Vec::new();
         }
-        self.active.insert(kind, now);
+        self.active.insert(
+            kind,
+            ActiveAlert {
+                raised_at: now,
+                last_signalled_at: now,
+            },
+        );
         vec![AlertEvent {
             kind,
             transition: Transition::Raised,
             detail,
         }]
+    }
+
+    /// Re-emit care alerts that are still active and unacknowledged.
+    fn reminders(&mut self, now: Instant) -> Vec<AlertEvent> {
+        let Some(every) = self.config.repeat_care_alert else {
+            return Vec::new();
+        };
+
+        let mut events = Vec::new();
+        for (kind, state) in self.active.iter_mut() {
+            if !kind.is_care_alert() || now.duration_since(state.last_signalled_at) < every {
+                continue;
+            }
+            state.last_signalled_at = now;
+            events.push(AlertEvent {
+                kind: *kind,
+                transition: Transition::Reminder,
+                detail: format!(
+                    "{kind:?} still active and unacknowledged after {:.0}s",
+                    now.duration_since(state.raised_at).as_secs_f64()
+                ),
+            });
+        }
+        events
     }
 
     fn clear_if_active(&mut self, kind: AlertKind, _now: Instant) -> Vec<AlertEvent> {
@@ -698,6 +749,120 @@ mod tests {
         let later = t0 + Duration::from_secs(120);
         e.tick(later);
         assert_eq!(e.snapshot(later)["present"], false);
+    }
+
+    /// An unacknowledged fall must keep telling someone. One notification at
+    /// 03:00 into a notifier that happened to be down is the same as none.
+    #[test]
+    fn an_unacknowledged_care_alert_is_repeated() {
+        let t0 = Instant::now();
+        let config = AlertConfig {
+            repeat_care_alert: Some(Duration::from_secs(300)),
+            ..AlertConfig::default()
+        };
+        let mut e = AlertEngine::new(config, None, t0);
+
+        let mut r = reading(1, true, 16.0);
+        r.fall_detected = true;
+        assert_eq!(
+            kinds(&e.ingest(&r, t0), Transition::Raised),
+            vec![AlertKind::Fall]
+        );
+
+        // Nothing before the interval elapses.
+        let mut reminders = 0;
+        for i in 1..=299 {
+            let now = t0 + Duration::from_secs(i);
+            e.ingest(&reading(1, true, 16.0), now);
+            reminders += kinds(&e.tick(now), Transition::Reminder).len();
+        }
+        assert_eq!(reminders, 0, "reminded before the interval elapsed");
+
+        let due = t0 + Duration::from_secs(301);
+        e.ingest(&reading(1, true, 16.0), due);
+        assert_eq!(
+            kinds(&e.tick(due), Transition::Reminder),
+            vec![AlertKind::Fall]
+        );
+
+        // And again one interval later, not every tick in between.
+        let mut reminders = 0;
+        for i in 302..=602 {
+            let now = t0 + Duration::from_secs(i);
+            e.ingest(&reading(1, true, 16.0), now);
+            reminders += kinds(&e.tick(now), Transition::Reminder).len();
+        }
+        assert_eq!(reminders, 1, "expected exactly one further reminder");
+    }
+
+    #[test]
+    fn acknowledging_stops_the_reminders() {
+        let t0 = Instant::now();
+        let config = AlertConfig {
+            repeat_care_alert: Some(Duration::from_secs(60)),
+            ..AlertConfig::default()
+        };
+        let mut e = AlertEngine::new(config, None, t0);
+
+        let mut r = reading(1, true, 16.0);
+        r.fall_detected = true;
+        e.ingest(&r, t0);
+        assert!(e.acknowledge(AlertKind::Fall));
+
+        let mut reminders = 0;
+        for i in 1..=600 {
+            let now = t0 + Duration::from_secs(i);
+            e.ingest(&reading(1, true, 16.0), now);
+            reminders += kinds(&e.tick(now), Transition::Reminder).len();
+        }
+        assert_eq!(reminders, 0);
+    }
+
+    /// Node health is informational; repeating it would just be noise from a
+    /// node that is simply unplugged.
+    #[test]
+    fn node_health_events_are_never_repeated() {
+        let t0 = Instant::now();
+        let config = AlertConfig {
+            repeat_care_alert: Some(Duration::from_secs(60)),
+            ..AlertConfig::default()
+        };
+        let mut e = AlertEngine::new(config, None, t0);
+        e.ingest(&reading(1, true, 16.0), t0);
+
+        let mut reminders = Vec::new();
+        for i in 1..=600 {
+            reminders.extend(kinds(
+                &e.tick(t0 + Duration::from_secs(i)),
+                Transition::Reminder,
+            ));
+        }
+        assert!(
+            !reminders.contains(&AlertKind::NodeSilent { node_id: 1 }),
+            "node health must not repeat, got {reminders:?}"
+        );
+    }
+
+    #[test]
+    fn reminders_can_be_disabled() {
+        let t0 = Instant::now();
+        let config = AlertConfig {
+            repeat_care_alert: None,
+            ..AlertConfig::default()
+        };
+        let mut e = AlertEngine::new(config, None, t0);
+
+        let mut r = reading(1, true, 16.0);
+        r.fall_detected = true;
+        e.ingest(&r, t0);
+
+        let mut reminders = 0;
+        for i in 1..=5000 {
+            let now = t0 + Duration::from_secs(i);
+            e.ingest(&reading(1, true, 16.0), now);
+            reminders += kinds(&e.tick(now), Transition::Reminder).len();
+        }
+        assert_eq!(reminders, 0);
     }
 
     #[test]
