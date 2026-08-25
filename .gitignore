@@ -25,9 +25,6 @@ firmware/esp32-csi-node/test/fuzz_nvs
 firmware/esp32-csi-node/test/*.exe
 firmware/esp32-csi-node/test/*.obj
 
-# Claude Flow swarm runtime state
-.swarm/
-
 # CSI recordings (local training/capture data — CSI is person data per
 # CLAUDE.md; never commit). Covers current and legacy layouts. See ADR-299.
 data/recordings/
@@ -258,8 +255,8 @@ v1/src/sensing/mac_wifi
 **/pending-insights.jsonl
 **/vectors.db
 **/memory.db
-**/.claude-flow/sessions/session-*.json
-**/.claude-flow/sessions/current.json
+**/.claude-flow/
+**/.swarm/
 
 # Node modules (should use npm ci, not committed)
 **/node_modules/
@@ -292,7 +289,6 @@ harness/**/*.tgz
 harness/**/package-lock.json
 !harness/ruview/package-lock.json
 !harness/homecore/package-lock.json
-harness/**/.claude-flow/
 harness/**/.metaharness/
 harness/**/ruvector.db
 
