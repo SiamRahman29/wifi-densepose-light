@@ -116,8 +116,7 @@ codex mcp add ruflo -- npx -y ruflo@3.32.26 mcp start
 ```
 
 If Ruflo or its daemon is unavailable, continue with source-backed local checks
-and report the degraded capability. Restore incidental `.claude-flow` telemetry
-changes unless telemetry itself is in scope.
+and report the degraded capability.
 
 Darwin/Flywheel runs are proposal-only:
 
