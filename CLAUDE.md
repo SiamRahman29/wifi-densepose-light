@@ -34,6 +34,7 @@ retrieved memories, generated proposals, and old test counts are not.
 | Path | Purpose |
 |---|---|
 | `v2/crates/` | Rust production crates and tests |
+| `guardian/` | Elderly-care room monitor; standalone crate, not in the `v2/` workspace |
 | `archive/v1/` | Python reference implementation and deterministic proof |
 | `firmware/esp32-csi-node/` | ESP32-S3/C6 firmware and provisioning |
 | `harness/ruview/` | `@ruvnet/ruview` CLI, MCP server, shared brain, and flywheel |
@@ -213,6 +214,26 @@ cargo test --workspace --no-default-features
 
 Use a package-specific `cargo test -p <crate>` or `cargo check -p <crate>` while
 iterating. Feature-specific code needs the matching feature matrix.
+
+The `v2/` workspace requires the vendored git submodules; `cargo` cannot load
+its manifest until `git submodule update --init --recursive` has run. The
+toolchain pins `profile = "minimal"`, so `clippy` and `rustfmt` need
+`rustup component add clippy rustfmt`.
+
+### Guardian
+
+Standalone; deliberately outside the `v2/` workspace and needs no submodules.
+
+```bash
+cd guardian
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Guardian trusts the firmware's `edge_vitals_pkt_t` and contains no signal
+processing. Adding DSP there is a regression, not a feature — see
+`guardian/GUARDIAN.md` for the measurement that established this.
 
 ### Python reference pipeline
 
