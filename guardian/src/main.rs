@@ -8,9 +8,7 @@
 //! processing is correct and the server must not re-derive its numbers. See
 //! GUARDIAN.md for the measurements that established this.
 
-mod alerts;
-mod net;
-mod vitals;
+use guardian::{alerts, capture, net, vitals};
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -26,6 +24,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use alerts::{AlertConfig, AlertEngine, AlertEvent, AlertKind, Transition};
+use capture::Recorder;
 use net::Allowlist;
 use vitals::MAX_PACKET_LEN;
 
@@ -76,6 +75,13 @@ struct Args {
     /// Seconds a node may go quiet before it is considered offline.
     #[arg(long, default_value = "60")]
     node_silent_timeout_secs: u64,
+
+    /// Record every accepted packet to a capture file for later replay.
+    ///
+    /// A capture records when a specific person was present, moving, and
+    /// breathing. Treat it as health data: keep it local and never commit it.
+    #[arg(long, value_name = "PATH")]
+    record: Option<std::path::PathBuf>,
 }
 
 struct AppState {
@@ -130,6 +136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         engine: Mutex::new(AlertEngine::new(config, trusted_nodes, Instant::now())),
     });
 
+    let recorder = match &args.record {
+        Some(path) => {
+            let r =
+                Recorder::create(path).map_err(|e| format!("--record {}: {e}", path.display()))?;
+            warn!(
+                path = %path.display(),
+                "recording vitals to disk; captures contain personal health data"
+            );
+            Some(r)
+        }
+        None => None,
+    };
+
     let udp_addr = SocketAddr::new(args.udp_bind, args.udp_port);
     let socket = UdpSocket::bind(udp_addr).await?;
     info!(%udp_addr, "listening for ESP32 edge vitals");
@@ -150,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
 
     tokio::select! {
-        r = receive_loop(socket, allowlist, state.clone()) => r?,
+        r = receive_loop(socket, allowlist, state.clone(), recorder) => r?,
         r = tick_loop(state.clone(), config.node_silent_timeout) => r,
         r = axum::serve(listener, router) => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
@@ -163,9 +182,11 @@ async fn receive_loop(
     socket: UdpSocket,
     allowlist: Allowlist,
     state: Arc<AppState>,
+    mut recorder: Option<Recorder>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; MAX_PACKET_LEN];
     let mut dropped_unauthorised: u64 = 0;
+    let capture_started = Instant::now();
 
     loop {
         let (len, src) = match socket.recv_from(&mut buf).await {
@@ -189,6 +210,16 @@ async fn receive_loop(
         let Some(reading) = vitals::parse_vitals(&buf[..len]) else {
             continue;
         };
+
+        // Recorded after parsing, so a capture holds only well-formed vitals
+        // and replaying it exercises the same path the live nodes drive.
+        if let Some(rec) = recorder.as_mut() {
+            let offset_ms = capture_started.elapsed().as_millis() as u64;
+            if let Err(e) = rec.record(offset_ms, &buf[..len]) {
+                error!(error = %e, "capture write failed; continuing without recording");
+                recorder = None;
+            }
+        }
 
         let now = Instant::now();
         let events = state.engine.lock().await.ingest(&reading, now);

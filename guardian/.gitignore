@@ -1,1 +1,4 @@
 /target
+# Captures record when a real person was present, moving, and breathing.
+# Treat them as health data: keep them local, never commit them.
+*.jsonl
