@@ -70,7 +70,7 @@ pub enum Transition {
 /// Bookkeeping for one active condition.
 #[derive(Debug, Clone, Copy)]
 struct ActiveAlert {
-    #[allow(dead_code)]
+    /// Used to report how long a condition has been unattended.
     raised_at: Instant,
     /// When this condition last produced an event, so reminders can be paced.
     last_signalled_at: Instant,
