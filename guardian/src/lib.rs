@@ -7,4 +7,5 @@
 pub mod alerts;
 pub mod capture;
 pub mod net;
+pub mod notify;
 pub mod vitals;
