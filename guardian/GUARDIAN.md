@@ -6,8 +6,11 @@ leaving the node.
 
 ```bash
 cd guardian
-cargo run -- --udp-bind 0.0.0.0 --udp-allow 192.168.1.0/24 --alert-nodes 1
+cargo run --bin guardian -- --udp-bind 0.0.0.0 --udp-allow 192.168.1.0/24 --alert-nodes 1
 ```
+
+Two binaries: `guardian`, the monitor, and `guardian-replay`, which feeds it a
+recorded capture.
 
 ## Why this is a separate crate
 
@@ -164,16 +167,55 @@ not a code one.
 **This decision is still open.** It only affects the alert layer, so it does not
 block anything else.
 
-## Fall detection: unsolved validation problem
+## Fall detection: still unvalidated
 
 Guardian currently forwards the firmware's fall flag; it does not implement its
 own heuristic. The heuristic is buildable (large transient, then sustained
 post-event stillness, no return to upright motion). *Validating* it is the hard
 part: you cannot test on your grandmother. It needs a proxy — weighted cushion
-drops, or a younger person falling onto a mattress — before any fall alert
-should be trusted.
+drops, or a younger person falling onto a mattress.
 
-Until that validation exists, treat `fall` as an unverified signal.
+**Until that proxy validation exists, treat `fall` as an unverified signal.**
+
+What Guardian now provides is the machinery to do that work, because a staged
+fall is expensive and awkward to reproduce and you cannot re-stage it on every
+threshold change:
+
+```bash
+guardian --record captures/fall-proxy-01.jsonl   # stage the event once
+guardian-replay captures/fall-proxy-01.jsonl --inspect
+guardian-replay captures/fall-proxy-01.jsonl --speed 4   # iterate forever
+```
+
+Build a library of captures — staged falls, someone sitting down heavily, a
+dropped bag, normal nights — and replay the whole set against every change to
+the alert rules. A capture that must *not* alert is worth as much as one that
+must.
+
+## Record and replay
+
+`--record <path>` writes every accepted packet to a JSONL capture as
+`{"offset_ms", "data"}`, flushed per packet so that killing the process — the
+normal way a capture ends — keeps the seconds around the event. Packets are
+recorded *after* parsing, so a capture holds only well-formed vitals and
+replaying it drives the same path the live nodes do.
+
+`guardian-replay` sends a capture back at a running Guardian:
+
+| Flag | Effect |
+|---|---|
+| `--target` | where to send (default `127.0.0.1:5005`) |
+| `--speed` | playback multiplier; `0` sends as fast as possible, which is meaningless for any rule with a timeout |
+| `--repeat` | loop forever |
+| `--inspect` | describe the capture and exit without sending |
+
+Leading offsets are normalised to the first packet, so the gap between starting
+the recorder and starting the nodes is not replayed as dead air.
+
+> **Captures are personal health data.** A capture records when a specific
+> person was present, moving, and breathing, and at what rate. Keep them local,
+> get consent before recording anyone, and never commit them — `.gitignore`
+> excludes `*.jsonl` under this crate for exactly that reason.
 
 ## Alert delivery
 
@@ -195,14 +237,20 @@ obvious absence of one.
 
 ```bash
 cd guardian
-cargo test              # 28 tests: parsers, allowlist, alert state machine
+cargo test                                  # unit + end-to-end
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The alert engine takes an explicit `now: Instant` at every entry point, so
-timeout behaviour (including the 12-hour absence rule) is tested without
-sleeping.
+Two layers, and both earn their place:
+
+- **Unit tests** cover the parsers, the allowlist, and the alert state machine.
+  The engine takes an explicit `now: Instant` at every entry point, so timeout
+  behaviour — including the 12-hour absence rule — is tested without sleeping.
+- **End-to-end tests** (`tests/end_to_end.rs`) spawn the real binary, send real
+  UDP packets, and read the real HTTP surface. This layer is not redundant: the
+  stale-reading bug, where a dead node's last good breathing value suppressed
+  the apnea alarm indefinitely, passed every unit test and was caught only here.
 
 `evidence/` holds the measurement this design rests on: `motion-test.py` is the
 A/B/C reproducer, `motion-test-results.json` its output, and
