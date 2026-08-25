@@ -1,0 +1,51 @@
+# Guardian systemd unit. Install to /etc/systemd/system/guardian.service.
+#
+#   sudo install -m 0755 target/release/guardian /usr/local/bin/guardian
+#   sudo systemctl enable --now guardian
+#
+# Adjust the allowlist to your nodes' addresses and --alert-nodes to the nodes
+# whose placement you actually trust.
+
+[Unit]
+Description=Guardian elderly-care room monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/guardian \
+    --udp-bind 0.0.0.0 \
+    --udp-allow 192.168.1.0/24 \
+    --alert-nodes 1 \
+    --notify-command /etc/guardian/notify.sh
+Environment=RUST_LOG=guardian=info
+
+# A monitor that dies at 03:00 and stays dead is worse than no monitor, so
+# restart always rather than on-failure.
+Restart=always
+RestartSec=5s
+
+# Least authority: Guardian needs a UDP socket, a TCP socket, and the ability
+# to run the notify command. Nothing else.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Uncomment, and add --record, to capture traffic for replay. Captures contain
+# personal health data: keep them local and never commit them.
+# ReadWritePaths=/var/lib/guardian
+
+[Install]
+WantedBy=multi-user.target
