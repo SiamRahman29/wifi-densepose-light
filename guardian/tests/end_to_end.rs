@@ -258,6 +258,175 @@ fn replay_rejects_an_empty_capture() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Write an executable notify script that appends each alert to a log file.
+fn notify_script(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("notify.sh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n             printf '%s|%s|%s\\n' \"$GUARDIAN_ALERT_KIND\" \"$GUARDIAN_TRANSITION\"              \"$GUARDIAN_SEVERITY\" >> {}\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path
+}
+
+/// A fall must actually reach the notify command, not just the log.
+#[test]
+fn alerts_reach_the_notify_command() {
+    let dir = std::env::temp_dir().join(format!("guardian-notify-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("delivered.txt");
+    let script = notify_script(&dir, &log);
+
+    let h = Harness::start(&[
+        "--notify-command",
+        script.to_str().unwrap(),
+        "--apnea-timeout-secs",
+        "30",
+        "--node-silent-timeout-secs",
+        "30",
+        "--repeat-alert-secs",
+        "0",
+    ]);
+
+    h.send(&vitals(1, true, false, 16.0, 72.0));
+    h.send(&vitals(1, true, true, 16.0, 72.0));
+    h.await_alerts("fall", Duration::from_secs(5), |a| a.contains("fall"));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut delivered = String::new();
+    while Instant::now() < deadline {
+        delivered = std::fs::read_to_string(&log).unwrap_or_default();
+        if delivered.contains("fall") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        delivered.contains("fall|raised|care"),
+        "notify command did not receive the fall: {delivered:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An unacknowledged care alert must keep notifying, and stop once acked.
+#[test]
+fn unacknowledged_alerts_are_repeated_until_acknowledged() {
+    let dir = std::env::temp_dir().join(format!("guardian-repeat-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("delivered.txt");
+    let script = notify_script(&dir, &log);
+
+    let h = Harness::start(&[
+        "--notify-command",
+        script.to_str().unwrap(),
+        "--apnea-timeout-secs",
+        "30",
+        "--node-silent-timeout-secs",
+        "30",
+        "--repeat-alert-secs",
+        "1",
+    ]);
+
+    h.send(&vitals(1, true, false, 16.0, 72.0));
+    h.send(&vitals(1, true, true, 16.0, 72.0));
+    h.await_alerts("fall", Duration::from_secs(5), |a| a.contains("fall"));
+
+    let count_reminders = |log: &std::path::Path| {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("fall|reminder"))
+            .count()
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && count_reminders(&log) < 2 {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        count_reminders(&log) >= 2,
+        "expected repeated reminders, log was {:?}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // Acknowledging stops them.
+    assert_eq!(h.post("/alerts/fall/ack")["cleared"], true);
+    std::thread::sleep(Duration::from_millis(500));
+    let after_ack = count_reminders(&log);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        count_reminders(&log),
+        after_ack,
+        "reminders continued after acknowledgement"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A notify command that hangs must not stall packet reception, or the monitor
+/// manufactures the node-silence it was asked to report.
+#[test]
+fn a_hanging_notify_command_does_not_stall_reception() {
+    let dir = std::env::temp_dir().join(format!("guardian-hang-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("hang.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh
+sleep 30
+",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let h = Harness::start(&[
+        "--notify-command",
+        script.to_str().unwrap(),
+        "--notify-timeout-secs",
+        "30",
+        "--apnea-timeout-secs",
+        "30",
+        "--node-silent-timeout-secs",
+        "4",
+        "--repeat-alert-secs",
+        "0",
+    ]);
+
+    // Trigger a fall, which starts a notify command that will hang for 30s.
+    h.send(&vitals(1, true, false, 16.0, 72.0));
+    h.send(&vitals(1, true, true, 16.0, 72.0));
+    h.await_alerts("fall", Duration::from_secs(5), |a| a.contains("fall"));
+
+    // Meanwhile keep the node reporting. If reception were stalled behind the
+    // notifier, node 1 would be declared silent.
+    h.stream(
+        &[vitals(1, true, false, 16.0, 72.0)],
+        Duration::from_secs(8),
+    );
+
+    let active = h.get("/alerts")["active"].to_string();
+    assert!(
+        !active.contains("node_silent"),
+        "reception stalled behind the notify command: {active}"
+    );
+    assert_eq!(h.get("/status")["nodes"][0]["online"], true);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Build a 32-byte `edge_vitals_pkt_t` matching `edge_processing.h:140`.
 fn vitals(node_id: u8, presence: bool, fall: bool, breathing_bpm: f64, hr_bpm: f64) -> Vec<u8> {
     let mut b = vec![0u8; 32];
