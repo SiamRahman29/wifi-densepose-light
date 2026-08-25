@@ -8,7 +8,7 @@
 //! processing is correct and the server must not re-derive its numbers. See
 //! GUARDIAN.md for the measurements that established this.
 
-use guardian::{alerts, capture, net, vitals};
+use guardian::{alerts, capture, net, notify, vitals};
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use tracing::{error, info, warn};
 use alerts::{AlertConfig, AlertEngine, AlertEvent, AlertKind, Transition};
 use capture::Recorder;
 use net::Allowlist;
+use notify::Notifier;
 use vitals::MAX_PACKET_LEN;
 
 #[derive(Parser, Debug)]
@@ -75,6 +76,28 @@ struct Args {
     /// Seconds a node may go quiet before it is considered offline.
     #[arg(long, default_value = "60")]
     node_silent_timeout_secs: u64,
+
+    /// Command to run on every alert transition. Receives GUARDIAN_ALERT_KIND,
+    /// GUARDIAN_TRANSITION, GUARDIAN_SEVERITY, GUARDIAN_DETAIL and, for node
+    /// health events, GUARDIAN_NODE_ID in its environment.
+    ///
+    /// Without this, alerts are only logged — which notifies nobody.
+    #[arg(long, value_name = "PATH")]
+    notify_command: Option<std::path::PathBuf>,
+
+    /// Seconds a single notify attempt may take before it is killed.
+    #[arg(long, default_value = "10")]
+    notify_timeout_secs: u64,
+
+    /// Attempts for a care alert before giving up. Node health is never
+    /// retried.
+    #[arg(long, default_value = "3")]
+    notify_attempts: u32,
+
+    /// Seconds between reminders for a care alert that is still active and
+    /// unacknowledged. 0 disables reminders.
+    #[arg(long, default_value = "300")]
+    repeat_alert_secs: u64,
 
     /// Record every accepted packet to a capture file for later replay.
     ///
@@ -130,11 +153,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apnea_timeout: Duration::from_secs(args.apnea_timeout_secs),
         absence_timeout: Duration::from_secs(args.absence_timeout_secs),
         node_silent_timeout: Duration::from_secs(args.node_silent_timeout_secs),
+        repeat_care_alert: (args.repeat_alert_secs > 0)
+            .then(|| Duration::from_secs(args.repeat_alert_secs)),
     };
 
     let state = Arc::new(AppState {
         engine: Mutex::new(AlertEngine::new(config, trusted_nodes, Instant::now())),
     });
+
+    let notifier = match &args.notify_command {
+        Some(path) => {
+            // Checked at startup rather than at 03:00 on the night it matters.
+            if !path.is_file() {
+                return Err(format!("--notify-command {}: not a file", path.display()).into());
+            }
+            info!(command = %path.display(), "alerts will be delivered via notify command");
+            Some(Notifier::new(
+                path.clone(),
+                Duration::from_secs(args.notify_timeout_secs),
+                args.notify_attempts,
+            ))
+        }
+        None => {
+            warn!("no --notify-command set: alerts are written to the log only, which notifies nobody");
+            None
+        }
+    };
 
     let recorder = match &args.record {
         Some(path) => {
@@ -169,8 +213,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state.clone());
 
     tokio::select! {
-        r = receive_loop(socket, allowlist, state.clone(), recorder) => r?,
-        r = tick_loop(state.clone(), config.node_silent_timeout) => r,
+        r = receive_loop(socket, allowlist, state.clone(), recorder, notifier.clone()) => r?,
+        r = tick_loop(state.clone(), config, notifier.clone()) => r,
         r = axum::serve(listener, router) => r?,
         _ = tokio::signal::ctrl_c() => info!("shutting down"),
     }
@@ -183,6 +227,7 @@ async fn receive_loop(
     allowlist: Allowlist,
     state: Arc<AppState>,
     mut recorder: Option<Recorder>,
+    notifier: Option<Notifier>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; MAX_PACKET_LEN];
     let mut dropped_unauthorised: u64 = 0;
@@ -223,32 +268,62 @@ async fn receive_loop(
 
         let now = Instant::now();
         let events = state.engine.lock().await.ingest(&reading, now);
-        report(&events);
+        report(&events, notifier.as_ref());
     }
 }
 
-async fn tick_loop(state: Arc<AppState>, node_silent_timeout: Duration) -> ! {
-    // Evaluate several times per silence window so a timeout is noticed
-    // promptly rather than up to a full window late.
-    let period = (node_silent_timeout / 4).max(Duration::from_secs(1));
+async fn tick_loop(state: Arc<AppState>, config: AlertConfig, notifier: Option<Notifier>) -> ! {
+    let period = tick_period(&config);
+    info!(?period, "evaluating time-based alert conditions");
     let mut ticker = tokio::time::interval(period);
     loop {
         ticker.tick().await;
         let events = state.engine.lock().await.tick(Instant::now());
-        report(&events);
+        report(&events, notifier.as_ref());
     }
 }
 
-/// Emit alert transitions.
+/// How often to re-evaluate time-based conditions.
 ///
-/// This is the seam where a real notifier (SMS, push, a siren) is wired in.
-/// Logging is deliberately all it does today: an untested notification path in
-/// a care product is worse than an obvious absence of one.
-fn report(events: &[AlertEvent]) {
+/// Derived from the *shortest* configured threshold, not just one of them: a
+/// period tied only to the node-silence window would let a shorter apnea
+/// timeout or reminder interval fire late, or in the reminder's case never at
+/// the requested cadence at all. The absence timeout is excluded because it is
+/// measured in hours and would otherwise pin the period at the ceiling.
+fn tick_period(config: &AlertConfig) -> Duration {
+    let shortest = [
+        Some(config.apnea_timeout),
+        Some(config.node_silent_timeout),
+        config.repeat_care_alert,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(Duration::from_secs(4));
+
+    // Four evaluations per window keeps a timeout from firing a full window
+    // late, and the clamp keeps a pathological config from spinning or from
+    // going effectively unresponsive.
+    (shortest / 4).clamp(Duration::from_millis(200), Duration::from_secs(5))
+}
+
+/// Log alert transitions and hand them to the notify command.
+///
+/// Logging happens first and unconditionally, so a failing or absent notifier
+/// still leaves a record of what the monitor saw.
+///
+/// Delivery is spawned rather than awaited: a notify command that hangs for its
+/// full timeout, retried, would otherwise stall the UDP receive loop for tens
+/// of seconds, dropping packets and manufacturing the very node-silence it was
+/// being asked to report.
+fn report(events: &[AlertEvent], notifier: Option<&Notifier>) {
     for event in events {
         match (event.transition, event.kind.is_care_alert()) {
             (Transition::Raised, true) => {
                 error!(kind = ?event.kind, "ALERT: {}", event.detail)
+            }
+            (Transition::Reminder, _) => {
+                error!(kind = ?event.kind, "STILL ACTIVE: {}", event.detail)
             }
             (Transition::Raised, false) => {
                 warn!(kind = ?event.kind, "node health: {}", event.detail)
@@ -256,6 +331,11 @@ fn report(events: &[AlertEvent]) {
             (Transition::Cleared, _) => {
                 info!(kind = ?event.kind, "cleared: {}", event.detail)
             }
+        }
+
+        if let Some(n) = notifier {
+            let (n, event) = (n.clone(), event.clone());
+            tokio::spawn(async move { n.deliver(&event).await });
         }
     }
 }
@@ -277,4 +357,50 @@ async fn ack_fall(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde
         StatusCode::OK,
         Json(serde_json::json!({ "cleared": cleared })),
     )
+}
+
+#[cfg(test)]
+mod tick_period_tests {
+    use super::*;
+
+    fn config(apnea: u64, silent: u64, repeat: Option<u64>) -> AlertConfig {
+        AlertConfig {
+            apnea_timeout: Duration::from_secs(apnea),
+            absence_timeout: Duration::from_secs(12 * 3600),
+            node_silent_timeout: Duration::from_secs(silent),
+            repeat_care_alert: repeat.map(Duration::from_secs),
+        }
+    }
+
+    #[test]
+    fn tracks_the_shortest_threshold_not_just_node_silence() {
+        // A short reminder interval must not be starved by a long silence
+        // window; this was a real bug caught end to end.
+        let p = tick_period(&config(30, 30, Some(1)));
+        assert!(p <= Duration::from_millis(250), "period was {p:?}");
+    }
+
+    #[test]
+    fn a_short_apnea_timeout_shortens_the_period() {
+        assert!(tick_period(&config(2, 60, Some(300))) <= Duration::from_millis(500));
+    }
+
+    #[test]
+    fn the_long_absence_timeout_never_stretches_the_period() {
+        assert!(tick_period(&config(60, 60, None)) <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn stays_within_the_clamp() {
+        // Pathologically small.
+        assert_eq!(
+            tick_period(&config(1, 1, Some(1))),
+            Duration::from_millis(250)
+        );
+        // Pathologically large.
+        assert_eq!(
+            tick_period(&config(86_400, 86_400, None)),
+            Duration::from_secs(5)
+        );
+    }
 }
