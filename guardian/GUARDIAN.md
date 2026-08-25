@@ -219,10 +219,65 @@ the recorder and starting the nodes is not replayed as dead air.
 
 ## Alert delivery
 
-`report()` in `src/main.rs` logs transitions and is the seam where a real
-notifier (SMS, push, siren) is wired in. Logging is deliberately all it does
-today: an untested notification path in a care product is worse than an
-obvious absence of one.
+`--notify-command <path>` runs a command on every alert transition. Guardian
+speaks no particular notification service: a three-line script wrapping `curl`
+covers ntfy, Pushover, a webhook or home automation, and `mpg123 siren.mp3`
+covers the case where the person who needs telling is in the next room.
+
+`contrib/notify-ntfy.sh` is a working example. Without a notify command
+Guardian only writes to the log, and says so loudly at startup, because a log
+file notifies nobody.
+
+The command receives the alert in its environment — not argv, so a detail string
+can never be mistaken for a flag by whatever the operator wrote:
+
+| Variable | Value |
+|---|---|
+| `GUARDIAN_ALERT_KIND` | `fall`, `no_breathing`, `no_presence`, `node_silent` |
+| `GUARDIAN_TRANSITION` | `raised`, `reminder`, `cleared` |
+| `GUARDIAN_SEVERITY` | `care` or `health` |
+| `GUARDIAN_DETAIL` | human-readable explanation, including the evidence |
+| `GUARDIAN_NODE_ID` | set only for `node_silent` |
+
+Exit non-zero to report failed delivery.
+
+The delivery rules are shaped by the failure that actually matters — a care
+alert emitted once, at 03:00, into a notifier that happens to be down is
+indistinguishable from having no monitor:
+
+- **Care alerts retry** (`--notify-attempts`, default 3, short linear backoff).
+  Node-health events do not: a flapping node would amplify rather than protect.
+- **Unacknowledged care alerts repeat** every `--repeat-alert-secs` (default
+  300; `0` disables) until the condition clears or is acknowledged. Node health
+  never repeats.
+- **Delivery never blocks reception.** The command is spawned, not awaited. A
+  notifier hanging for its full timeout would otherwise stall the UDP receive
+  loop for tens of seconds and manufacture the very node-silence it was being
+  asked to report. There is a test for exactly this.
+- **A hanging command is killed** after `--notify-timeout-secs` (default 10).
+- **A broken notifier never takes the monitor down.** Failures are logged as
+  `ALERT NOT DELIVERED` and the monitor keeps running.
+- The command's existence is checked at startup, not at 03:00 on the night it
+  matters.
+
+## Deployment
+
+`contrib/guardian.service` is a hardened systemd unit — `DynamicUser`,
+`ProtectSystem=strict`, a syscall filter, and `RestrictAddressFamilies` limited
+to what a UDP/TCP listener needs. It uses `Restart=always` rather than
+`on-failure`: a monitor that dies at 03:00 and stays dead is worse than no
+monitor.
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/guardian /usr/local/bin/guardian
+sudo install -m 0755 contrib/notify-ntfy.sh /etc/guardian/notify.sh
+sudo install -m 0644 contrib/guardian.service /etc/systemd/system/
+sudo systemctl enable --now guardian
+```
+
+Edit the unit's `--udp-allow` to your nodes' addresses and `--alert-nodes` to
+the nodes whose placement you actually trust.
 
 ## HTTP surface
 
@@ -232,6 +287,21 @@ obvious absence of one.
 | `/alerts` | GET | active alerts only |
 | `/alerts/fall/ack` | POST | acknowledge a latched fall alert |
 | `/healthz` | GET | liveness |
+
+## Status: what is and is not validated
+
+| Piece | Status |
+|---|---|
+| Packet parsing | MEASURED — round-tripped against the firmware layouts in tests |
+| Alert state machine | MEASURED — unit and end-to-end tests, including the failure modes above |
+| Alert delivery | MEASURED — end-to-end through a real command to an HTTP endpoint |
+| Behaviour against real ESP32 nodes | **NOT VALIDATED** — Guardian has not yet run against live silicon |
+| Fall detection accuracy | **NOT VALIDATED** — needs proxy testing, see above |
+| Heart rate | **NOT VALIDATED**, and deliberately never alerts |
+
+Everything above the line is tested against synthetic packets built from the
+firmware's own struct layouts. That is not the same as having run against the
+real nodes, which remains the next step.
 
 ## Validation
 
