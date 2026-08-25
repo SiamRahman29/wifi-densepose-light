@@ -6451,6 +6451,13 @@ async fn udp_receiver_task(
                     }
 
                     // Build nodes array with all active nodes.
+                    // Per-node CSI amplitudes are populated here too: the
+                    // vitals packet is only a summary, but `frame_history` is
+                    // fed unconditionally by the CSI path, so the UI would
+                    // otherwise see `amplitude: []` on every publish whenever
+                    // any node runs edge_tier=2. Honours the same
+                    // Restricted-class suppression as the CSI publish.
+                    let suppress_raw = s.engine_bridge.suppress_raw_outputs();
                     let active_nodes: Vec<NodeInfo> = s
                         .node_states
                         .iter()
@@ -6462,8 +6469,19 @@ async fn udp_receiver_task(
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
                             position: [2.0, 0.0, 1.5],
-                            amplitude: vec![],
-                            subcarrier_count: 0,
+                            amplitude: if suppress_raw {
+                                vec![]
+                            } else {
+                                n.frame_history
+                                    .back()
+                                    .map(|a| a.iter().take(56).cloned().collect())
+                                    .unwrap_or_default()
+                            },
+                            subcarrier_count: if suppress_raw {
+                                0
+                            } else {
+                                n.frame_history.back().map_or(0, |a| a.len())
+                            },
                             // Vitals-only path; still expose the sync snapshot
                             // if the node also speaks ESP-NOW.
                             sync: n.sync_snapshot(),
