@@ -1,0 +1,24 @@
+[package]
+name = "guardian"
+version = "0.1.0"
+edition = "2021"
+description = "Privacy-preserving elderly-care room monitor: presence, respiration, and fall alerts from ESP32 CSI edge vitals."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Deliberately standalone: NOT a member of the v2/ workspace. The keep-list is
+# the firmware, the UDP vitals receive path, and a thin alert layer. Joining the
+# v2 workspace would drag in nine git submodules and ~60 crates of pose
+# machinery that this binary does not use. See GUARDIAN.md.
+
+[dependencies]
+axum = "0.7"
+clap = { version = "4.4", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["rt-multi-thread", "net", "macros", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
